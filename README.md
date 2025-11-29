@@ -1,3 +1,4 @@
+> ⚠️ **Warning:** This branch (`claude/add-local-and-direct-llm-providers`) is under development and has not been fully tested. Expect bugs and breaking changes. For stable usage, please use the `main` branch.
 # ComfyUI-Z-Image-Utilities
 
 A collection of utility nodes for ComfyUI designed specifically for the [Z-Image](https://github.com/Tongyi-MAI/Z-Image) model.
