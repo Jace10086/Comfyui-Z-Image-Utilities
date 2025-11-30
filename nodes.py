@@ -48,7 +48,18 @@ except ImportError:
 
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import (
+        AutoTokenizer, 
+        AutoModelForCausalLM, 
+        AutoProcessor,
+        BitsAndBytesConfig
+    )
+    # Handle deprecation: AutoModelForVision2Seq -> AutoModelForImageTextToText
+    try:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForVision2Seq
+    
     from huggingface_hub import snapshot_download
     HAS_TRANSFORMERS = True
 except ImportError:
@@ -197,11 +208,15 @@ def get_or_create_session(session_id: str, model: str = "") -> Tuple[ChatSession
     """Get existing session or create a new one. Returns (session, is_new)."""
     global _cleanup_counter
     
-    # Run cleanup every 100 session accesses
+    # Run cleanup every 100 session accesses (non-critical race condition acceptable)
     _cleanup_counter += 1
     if _cleanup_counter >= 100:
         _cleanup_counter = 0
-        cleanup_old_sessions()
+        try:
+            cleanup_old_sessions()
+        except RuntimeError:
+            # Dictionary changed size during iteration - skip this cleanup cycle
+            pass
     
     is_new = session_id not in CHAT_SESSIONS
     if is_new:
@@ -232,9 +247,10 @@ def cleanup_old_sessions() -> int:
         Number of sessions removed.
     """
     cutoff = datetime.now() - timedelta(hours=MAX_SESSION_AGE_HOURS)
-    expired = [sid for sid, sess in CHAT_SESSIONS.items() if sess.last_used < cutoff]
+    # Take a snapshot of items to avoid RuntimeError during concurrent iteration
+    expired = [sid for sid, sess in list(CHAT_SESSIONS.items()) if sess.last_used < cutoff]
     for sid in expired:
-        del CHAT_SESSIONS[sid]
+        CHAT_SESSIONS.pop(sid, None)  # Use pop to avoid KeyError if already removed
     if expired:
         logger.info(f"Cleaned up {len(expired)} expired session(s)")
     return len(expired)
@@ -703,6 +719,8 @@ class DirectLocalModelClient(BaseLLMClient):
         self.device = device
         self.model = None
         self.tokenizer = None
+        self.processor = None
+        self.is_vl_model = False
     
     @staticmethod
     def get_models_dir() -> Path:
@@ -754,8 +772,16 @@ class DirectLocalModelClient(BaseLLMClient):
         # Check cache first
         if cache_key in self._model_cache:
             self._log(f"Using cached model: {cache_key}", "INFO")
-            self.model, self.tokenizer = self._model_cache[cache_key]
-            return self.model, self.tokenizer
+            cached_item = self._model_cache[cache_key]
+            self.model = cached_item[0]
+            # Check if this is a VL model processor or a text tokenizer
+            if hasattr(cached_item[1], 'image_processor'):
+                self.processor = cached_item[1]
+                self.is_vl_model = True
+            else:
+                self.tokenizer = cached_item[1]
+                self.is_vl_model = False
+            return self.model, cached_item[1]
         
         model_path = self.ensure_model_downloaded()
         
@@ -796,17 +822,49 @@ class DirectLocalModelClient(BaseLLMClient):
             model_kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
         
         try:
-            # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                str(model_path),
-                trust_remote_code=True
-            )
-            
-            # Load model
-            self.model = AutoModelForCausalLM.from_pretrained(
-                str(model_path),
-                **model_kwargs
-            )
+            # Check if this is a Vision-Language model
+            config_path = model_path / "config.json"
+            self.is_vl_model = False
+            architectures = []
+            model_type = ""
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        config = json.load(f)
+                        architectures = config.get("architectures", [])
+                        model_type = config.get("model_type", "")
+                        # Check for common VL architectures
+                        if any("Vision" in arch or "Qwen2VL" in arch or "Qwen3VL" in arch for arch in architectures) or \
+                           "vl" in model_type.lower() or "vision" in model_type.lower():
+                            self.is_vl_model = True
+                            self._log(f"Detected Vision-Language model: {model_type}", "INFO")
+                except (json.JSONDecodeError, IOError) as e:
+                    self._log(f"Warning: Could not parse config.json: {e}", "WARNING")
+
+            if self.is_vl_model:
+                # Load processor for VL models
+                self.processor = AutoProcessor.from_pretrained(
+                    str(model_path),
+                    trust_remote_code=True
+                )
+                
+                # Load model using AutoModelForVision2Seq
+                self.model = AutoModelForVision2Seq.from_pretrained(
+                    str(model_path),
+                    **model_kwargs
+                )
+            else:
+                # Load tokenizer for text models
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    trust_remote_code=True
+                )
+                
+                # Load model using AutoModelForCausalLM
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    str(model_path),
+                    **model_kwargs
+                )
             
             # Move to device if not using device_map
             if "device_map" not in model_kwargs:
@@ -816,10 +874,10 @@ class DirectLocalModelClient(BaseLLMClient):
             
             # Cache if requested
             if keep_loaded:
-                self._model_cache[cache_key] = (self.model, self.tokenizer)
+                self._model_cache[cache_key] = (self.model, self.tokenizer if not self.is_vl_model else self.processor)
             
             self._log(f"Model loaded successfully", "INFO")
-            return self.model, self.tokenizer
+            return self.model, self.tokenizer if not self.is_vl_model else self.processor
             
         except Exception as e:
             self._log(f"Failed to load model: {e}", "ERROR")
@@ -838,10 +896,24 @@ class DirectLocalModelClient(BaseLLMClient):
         """Generate response using loaded model."""
         self.clear_debug_log()
         
-        # Safety check for vision input
+        # Safety check for vision input on text-only models
+        has_images = False
+        image_inputs = []
+        
         for msg in messages:
             if isinstance(msg.get("content"), list):
-                raise ValueError("Direct model loading does not currently support image inputs/vision capabilities. Please disconnect the image or use OpenRouter/Local providers.")
+                has_images = True
+                # Extract images if present
+                for part in msg["content"]:
+                    if part.get("type") == "image_url":
+                        # Extract base64 and convert back to PIL
+                        url = part["image_url"]["url"]
+                        if url.startswith("data:image/png;base64,"):
+                            b64_str = url.split(",")[1]
+                            image_inputs.append(Image.open(BytesIO(base64.b64decode(b64_str))))
+        
+        if has_images and not self.is_vl_model:
+             raise ValueError("This model does not support vision inputs. Please use a Vision-Language model (e.g., Qwen-VL) or disconnect the image.")
 
         self._log(f"Direct Local Model - Repo: {self.repo_id}", "INFO")
         self._log(f"Quantization: {self.quantization.value}, Temperature: {temperature}")
@@ -856,26 +928,11 @@ class DirectLocalModelClient(BaseLLMClient):
                 torch.cuda.manual_seed_all(seed)
             self._log(f"Applied seed: {seed}")
 
-        # Format messages using chat template
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        # Tokenize
-        inputs = self.tokenizer(text, return_tensors="pt")
-        
-        # Move to model device
-        device = next(self.model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
         # Prepare generation arguments
         gen_kwargs = {
             "max_new_tokens": max_tokens,
             "temperature": temperature if temperature > 0 else None,
             "do_sample": temperature > 0,
-            "pad_token_id": self.tokenizer.eos_token_id,
         }
         
         # Map and add optional parameters
@@ -885,24 +942,102 @@ class DirectLocalModelClient(BaseLLMClient):
             gen_kwargs["top_k"] = int(kwargs["top_k"])
         if "repeat_penalty" in kwargs:
             gen_kwargs["repetition_penalty"] = float(kwargs["repeat_penalty"])
-            
-        self._log(f"Generation params: {gen_kwargs}")
 
-        # Generate
+        # Generate based on model type
         self._log("Generating response...", "INFO")
         
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                **gen_kwargs
-            )
-        
-        # Decode
-        input_len = inputs["input_ids"].shape[1]
-        response = self.tokenizer.decode(
-            outputs[0][input_len:],
-            skip_special_tokens=True
-        )
+            if self.is_vl_model:
+                # VL Model Generation (Qwen-VL style)
+                # Extract text prompt
+                text_prompt = ""
+                for msg in messages:
+                    if isinstance(msg["content"], str):
+                        text_prompt += msg["content"] + "\n"
+                    elif isinstance(msg["content"], list):
+                        for part in msg["content"]:
+                            if part["type"] == "text":
+                                text_prompt += part["text"] + "\n"
+                
+                # Prepare inputs using processor
+                # Try to use processor's chat template if available for better formatting
+                if hasattr(self.processor, 'apply_chat_template'):
+                    try:
+                        # Use the processor's built-in chat template
+                        formatted_text = self.processor.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                        self._log("Using processor's apply_chat_template", "INFO")
+                    except Exception as e:
+                        # Fallback to manual formatting if template fails
+                        self._log(f"Chat template failed ({e}), using manual format", "WARNING")
+                        formatted_text = f"User: {text_prompt}\nAssistant:"
+                else:
+                    # No chat template available, use manual formatting
+                    formatted_text = f"User: {text_prompt}\nAssistant:"
+                    self._log("No chat template available, using manual format", "INFO")
+                
+                # Process inputs with or without images
+                if image_inputs:
+                    inputs = self.processor(
+                        text=[formatted_text],
+                        images=image_inputs,
+                        padding=True,
+                        return_tensors="pt"
+                    )
+                    self._log(f"Processed {len(image_inputs)} image(s) with text", "INFO")
+                else:
+                    inputs = self.processor(
+                        text=[formatted_text],
+                        return_tensors="pt"
+                    )
+                
+                # Move inputs to device
+                device = next(self.model.parameters()).device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                outputs = self.model.generate(**inputs, **gen_kwargs)
+                
+                # Decode
+                if len(outputs.shape) == 2:
+                    # Standard output: [batch_size, sequence_length]
+                    generated_ids = outputs[0][len(inputs["input_ids"][0]):]
+                else:
+                    # Fallback for unexpected shapes
+                    generated_ids = outputs[0]
+                response = self.processor.decode(generated_ids, skip_special_tokens=True)
+                
+            else:
+                # Text-Only Model Generation
+                # Format messages using chat template
+                text = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                
+                # Tokenize
+                inputs = self.tokenizer(text, return_tensors="pt")
+                
+                # Move to model device
+                device = next(self.model.parameters()).device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                gen_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
+                
+                outputs = self.model.generate(
+                    **inputs,
+                    **gen_kwargs
+                )
+            
+                # Decode
+                input_len = inputs["input_ids"].shape[1]
+                response = self.tokenizer.decode(
+                    outputs[0][input_len:],
+                    skip_special_tokens=True
+                )
         
         self._log(f"Generated {len(response)} characters", "INFO")
         return response
@@ -943,10 +1078,22 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
     original_len = len(text)
     
     # Remove thinking tags (Qwen3 thinking mode)
-    if "<think>" in text:
+    # Handle both complete <think>...</think> blocks and orphaned </think> tags
+    # Some models output thinking without opening tag, only closing </think>
+    if "<think>" in text and "</think>" in text:
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
         if debug_log:
-            debug_log.append("Removed <think> tags")
+            debug_log.append("Removed <think>...</think> block")
+    elif "</think>" in text:
+        # Handle case where model outputs thinking without opening tag
+        # Everything before </think> is thinking, everything after is the answer
+        parts = text.split("</think>", 1)
+        if len(parts) == 2 and parts[1].strip():
+            text = parts[1].strip()
+            if debug_log:
+                debug_log.append(f"Removed thinking content before </think> tag ({len(parts[0])} chars)")
+        elif debug_log:
+            debug_log.append("Found </think> but no content after it, keeping original")
     
     # Remove markdown code blocks
     if text.startswith('```'):
@@ -973,7 +1120,52 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
        (text.startswith("'") and text.endswith("'")):
         text = text[1:-1].strip()
     
-    # IMPORTANT: Remove trailing quoted keyword lists
+    # NEW: Remove negative instruction phrases (useless for image generation)
+    # Pattern: no "X" or "Y" tags, no "X" tags, no "X" descriptors, etc.
+    negative_pattern = r',?\s*no\s+"[^"]{1,50}"(?:\s+or\s+"[^"]{1,50}")?\s+(?:tags?|descriptors?|effects?|elements?|overlays?|filters?|presence)'
+    neg_matches = list(re.finditer(negative_pattern, text, re.IGNORECASE))
+    if len(neg_matches) > 3:  # Only strip if there are many (likely a pattern gone wrong)
+        if debug_log:
+            debug_log.append(f"Removing {len(neg_matches)} negative instruction phrases")
+        text = re.sub(negative_pattern, '', text, flags=re.IGNORECASE)
+        # Clean up any resulting double commas or trailing commas
+        text = re.sub(r',\s*,', ',', text)
+        text = re.sub(r',\s*$', '.', text)
+        text = re.sub(r',\s*\.', '.', text)
+    
+    # NEW: Detect phrase-level repetition loops (semantic repetition)
+    # Split into comma-separated segments and look for repeated sequences
+    segments = [s.strip() for s in text.split(',') if s.strip()]
+    if len(segments) > 10:
+        # Look for repeating phrase patterns (sequences of 2-6 segments that repeat)
+        for pattern_len in range(2, 7):
+            if len(segments) >= pattern_len * 3:  # Need at least 3 repetitions
+                for start in range(len(segments) - pattern_len * 2):
+                    pattern = segments[start:start + pattern_len]
+                    # Check if this pattern repeats
+                    repeat_count = 1
+                    pos = start + pattern_len
+                    while pos + pattern_len <= len(segments):
+                        if segments[pos:pos + pattern_len] == pattern:
+                            repeat_count += 1
+                            pos += pattern_len
+                        else:
+                            break
+                    
+                    if repeat_count >= 3:  # Found 3+ repetitions
+                        if debug_log:
+                            debug_log.append(f"Detected phrase repetition loop: {pattern_len} phrases repeated {repeat_count} times at segment {start}")
+                        # Keep only up to the first repetition
+                        segments = segments[:start + pattern_len]
+                        text = ', '.join(segments)
+                        if text and text[-1] not in '.!?':
+                            text += '.'
+                        break
+                else:
+                    continue
+                break
+    
+    # IMPROVED: Remove trailing quoted keyword lists (more aggressive)
     # Pattern 1: "keyword" descriptor, "keyword" descriptor format
     keyword_list_pattern = r',\s*"[^"]{1,80}"\s+\w+(?:,\s*"[^"]{1,80}"\s+\w+){2,}\s*$'
     match = re.search(keyword_list_pattern, text)
@@ -981,7 +1173,6 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
         if debug_log:
             debug_log.append(f"Removed quoted keyword list at position {match.start()}")
         text = text[:match.start()].strip()
-        # Ensure ends with proper punctuation
         if text and text[-1] not in '.!?':
             text += '.'
     
@@ -994,12 +1185,12 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
         if text and text[-1] not in '.!?':
             text += '.'
     
-    # Fix repetition loops
+    # Fix exact character repetition loops (original pattern)
     repeat_pattern = r'(.{10,60}?)\1{2,}'
     match = re.search(repeat_pattern, text)
     if match:
         if debug_log:
-            debug_log.append(f"Fixed repetition loop at position {match.start()}")
+            debug_log.append(f"Fixed exact repetition loop at position {match.start()}")
         text = text[:match.start() + len(match.group(1))]
         last_period = text.rfind('.')
         if last_period > match.start() - 50:
@@ -1010,13 +1201,28 @@ def clean_llm_output(text: str, max_length: int = 0, debug_log: Optional[List[st
         if debug_log:
             debug_log.append(f"Output too long ({len(text)} chars), truncating to {max_length}")
         text = text[:max_length]
-        # Try to end at a sentence
+        # IMPROVED: Try to end at a complete phrase (period, comma, or natural break)
+        # First try period
         last_period = text.rfind('.')
-        if last_period > max_length - 200:
+        if last_period > max_length * 0.7:  # Within last 30%
             text = text[:last_period + 1]
+        else:
+            # Try comma as fallback
+            last_comma = text.rfind(',')
+            if last_comma > max_length * 0.85:  # Within last 15%
+                text = text[:last_comma] + '.'
     
     # Clean up extra whitespace
     text = re.sub(r'\s{2,}', ' ', text).strip()
+    
+    # Final cleanup: remove any trailing incomplete phrases after comma
+    if text and text[-1] not in '.!?"\'':
+        last_period = text.rfind('.')
+        last_comma = text.rfind(',')
+        if last_period > len(text) * 0.8:
+            text = text[:last_period + 1]
+        elif last_comma > len(text) * 0.9:
+            text = text[:last_comma] + '.'
     
     if debug_log:
         debug_log.append(f"Cleaned: {original_len} -> {len(text)} chars")
@@ -1517,7 +1723,7 @@ class Z_ImagePromptEnhancer:
         if estimated_tokens > 1024:
             debug_lines.append(f"WARNING: Prompt may exceed Z-Image-Turbo's 1024 token limit!")
         elif estimated_tokens > 512:
-            debug_lines.append(f"ℹINFO: Exceeds default 512 tokens. Users should set max_sequence_length=1024 in their pipeline.")
+            debug_lines.append(f"INFO: Exceeds default 512 tokens. Users should set max_sequence_length=1024 in their pipeline.")
         
         logger.info(f"Enhancement successful. Length: {len(enhanced)}")
         
