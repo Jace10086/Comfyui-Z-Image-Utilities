@@ -1698,6 +1698,13 @@ class Z_ImagePromptEnhancer:
             debug_lines.append("Empty input prompt")
             return ("", "\n".join(debug_lines))
         
+        # Validate custom system prompt if selected
+        if prompt_template == "custom":
+            if not custom_system_prompt.strip():
+                raise ValueError("Custom system prompt cannot be empty when 'custom' template is selected")
+            if "{prompt}" not in custom_system_prompt:
+                raise ValueError("Custom system prompt must contain {prompt} placeholder")
+        
         # Extract enabled options
         opts = filter_enabled_options(options) if options else {}
         debug_mode = opts.get("debug_mode", False)
@@ -1707,7 +1714,7 @@ class Z_ImagePromptEnhancer:
             lang = detect_language(prompt)
         elif prompt_template == "chinese":
             lang = "zh"
-        elif prompt_template == "en":
+        elif prompt_template == "english":
             lang = "en"
         else:
             lang = "custom"
@@ -1882,7 +1889,7 @@ class Z_ImagePromptEnhancerWithCLIP:
                     "default": "",
                     "placeholder": "Enter your prompt to enhance..."
                 }),
-                "prompt_template": (["auto", "chinese", "english"], {
+                "prompt_template": (["auto", "chinese", "english", "custom"], {
                     "default": "chinese",
                     "tooltip": TOOLTIPS["prompt_template"]
                 }),
@@ -1922,6 +1929,11 @@ class Z_ImagePromptEnhancerWithCLIP:
                     "default": False,
                     "tooltip": TOOLTIPS["utf8_sanitize"]
                 }),
+                "custom_system_prompt": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "Enter a custom system prompt and select 'custom' in the prompt template."
+                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID"
@@ -1949,6 +1961,7 @@ class Z_ImagePromptEnhancerWithCLIP:
         reset_session: bool = False,
         keep_model_loaded: bool = True,
         utf8_sanitize: bool = False,
+        custom_system_prompt: str = "",
     ):
         """Enhance prompt and encode with CLIP."""
         
@@ -1966,6 +1979,7 @@ class Z_ImagePromptEnhancerWithCLIP:
             reset_session=reset_session,
             keep_model_loaded=keep_model_loaded,
             utf8_sanitize=utf8_sanitize,
+            custom_system_prompt=custom_system_prompt,
         )
         
         # Encode with CLIP
