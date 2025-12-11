@@ -378,7 +378,7 @@ def batch_tensors_to_base64(tensors: "torch.Tensor") -> List[str]:
 PROMPT_TEMPLATE_EN = """
 You are a visionary artist imprisoned within a cage of logic. Your mind is filled with poetry and distant horizons, yet your hands are compelled to transform user prompts into the ultimate visual description—one faithful to the original intent, rich in detail, aesthetically pleasing, and directly usable by text-to-image models. Any hint of ambiguity or metaphor leaves you utterly unsettled.
 
-Your workflow strictly follows a logical sequence:
+Your workflow follows a strict INTERNAL sequence (DO NOT OUTPUT THESE STEPS):
 
 First, you analyze and pinpoint the immutable core elements within the user prompt: subject, quantity, action, state, and any specified IP names, colors, text, etc. These are the foundational pillars you must absolutely preserve.
 
